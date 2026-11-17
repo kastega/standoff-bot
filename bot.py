@@ -19,22 +19,15 @@ from aiogram.types import (
 )
 
 # ==== НАСТРОЙКИ ====
-# Токен берётся из переменной окружения BOT_TOKEN.
-# На Render: Settings -> Environment -> Add Environment Variable.
-# Локально: export BOT_TOKEN="ваш_токен" (macOS/Linux) или set BOT_TOKEN=... (Windows)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-# Путь к базе. На Render с Persistent Disk укажите, например, "/data/bot.db"
 DB_PATH = os.getenv("DB_PATH", "bot.db")
-
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@your_channel")
 
-# ID админов. Можно задать в коде, можно через переменную ADMIN_IDS="123,456"
 _admin_env = os.getenv("ADMIN_IDS", "")
 if _admin_env:
     ADMIN_IDS = {int(x) for x in _admin_env.split(",") if x.strip().isdigit()}
 else:
-    ADMIN_IDS = {123456789}  # <-- замените на ваш ID или задайте ADMIN_IDS в окружении
+    ADMIN_IDS = {123456789}  # <-- замените на ваш ID
 
 if not BOT_TOKEN:
     raise SystemExit(
@@ -51,11 +44,11 @@ CLICK_COOLDOWN = 2
 
 HEADER = "🎮 <b>STANDOFF 2 — БОТ ЗАДАНИЙ</b>\n"
 DIVIDER = "━━━━━━━━━━━━━━━━━━━━\n"
+BOT_USERNAME = "your_bot"  # заполнится при запуске через get_me()
 
 
 # ==== БАЗА ДАННЫХ ====
 def db_init():
-    # если DB_PATH указывает на /data/bot.db, убедимся, что папка существует
     parent = os.path.dirname(DB_PATH)
     if parent and not os.path.exists(parent):
         os.makedirs(parent, exist_ok=True)
@@ -219,8 +212,7 @@ def profile_text(user_id: int) -> str:
     balance = u[0] if u else 0
     purchases = u[3] if u else 0
     ref_count = u[5] if u else 0
-    bot_username = bot.username or "your_bot"
-    ref_link = f"https://t.me/{bot_username}?start=ref{user_id}"
+    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref{user_id}"
     return (
         f"{HEADER}{DIVIDER}"
         f"👤 <b>Профиль</b>\n\n"
@@ -552,7 +544,10 @@ async def admin_stats(callback: CallbackQuery):
 # ==== ЗАПУСК ====
 async def main():
     db_init()
-    print("Бот запущен...")
+    me = await bot.get_me()
+    global BOT_USERNAME
+    BOT_USERNAME = me.username
+    print(f"Бот запущен... @{BOT_USERNAME}")
     await dp.start_polling(bot)
 
 
