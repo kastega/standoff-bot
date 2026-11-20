@@ -27,13 +27,10 @@ _admin_env = os.getenv("ADMIN_IDS", "")
 if _admin_env:
     ADMIN_IDS = {int(x) for x in _admin_env.split(",") if x.strip().isdigit()}
 else:
-    ADMIN_IDS = {123456789}  # <-- замените на ваш ID, если не задан на Railway
+    ADMIN_IDS = {123456789}
 
 if not BOT_TOKEN:
-    raise SystemExit(
-        "Не задан BOT_TOKEN. Установите переменную окружения BOT_TOKEN "
-        "или впишите токен прямо в код (не рекомендуется для хостинга)."
-    )
+    raise SystemExit("Не задан BOT_TOKEN.")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -41,6 +38,8 @@ dp = Dispatcher()
 
 LAST_CLICK = {}
 CLICK_COOLDOWN = 2
+GAME_COOLDOWN = 30
+LAST_GAME = {}
 
 HEADER = "🎮 <b>STANDOFF 2 — БОТ ЗАДАНИЙ</b>\n"
 DIVIDER = "━━━━━━━━━━━━━━━━━━━━\n"
@@ -65,7 +64,8 @@ def db_init():
             referrer_id INTEGER DEFAULT NULL,
             ref_count INTEGER DEFAULT 0,
             twitch_done INTEGER DEFAULT 0,
-            last_bonus INTEGER DEFAULT 0
+            last_bonus INTEGER DEFAULT 0,
+            gold INTEGER DEFAULT 0
         )
     """)
     cur.execute("""
@@ -82,6 +82,16 @@ def db_init():
             PRIMARY KEY (code, user_id)
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount INTEGER,
+            details TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at INTEGER
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -90,7 +100,7 @@ def db_get_user(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "SELECT balance, sub_done, video_done, purchases, referrer_id, ref_count, twitch_done, last_bonus "
+        "SELECT balance, sub_done, video_done, purchases, referrer_id, ref_count, twitch_done, last_bonus, gold "
         "FROM users WHERE user_id = ?",
         (user_id,),
     )
@@ -117,6 +127,14 @@ def db_add_balance(user_id: int, amount: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+    conn.commit()
+    conn.close()
+
+
+def db_add_gold(user_id: int, amount: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET gold = gold + ? WHERE user_id = ?", (amount, user_id))
     conn.commit()
     conn.close()
 
@@ -219,18 +237,53 @@ def db_delete_promo(code: str):
     conn.close()
 
 
+def db_create_withdrawal(user_id: int, amount: int, details: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO withdrawals (user_id, amount, details, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, amount, details, int(time.time())),
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_get_pending_withdrawals():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id, user_id, amount, details FROM withdrawals WHERE status = 'pending' ORDER BY id")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def db_complete_withdrawal(withdrawal_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, amount FROM withdrawals WHERE id = ? AND status = 'pending'", (withdrawal_id,))
+    row = cur.fetchone()
+    if row:
+        user_id, amount = row
+        cur.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, user_id))
+        cur.execute("UPDATE withdrawals SET status = 'done' WHERE id = ?", (withdrawal_id,))
+    conn.commit()
+    conn.close()
+
+
 # ==== ОФОРМЛЕНИЕ ====
 def profile_text(user_id: int) -> str:
     u = db_get_user(user_id)
     balance = u[0] if u else 0
     purchases = u[3] if u else 0
     ref_count = u[5] if u else 0
+    gold = u[8] if u else 0
     ref_link = f"https://t.me/{BOT_USERNAME}?start=ref{user_id}"
     return (
         f"{HEADER}{DIVIDER}"
         f"👤 <b>Профиль</b>\n\n"
         f"🆔 ID: <code>{user_id}</code>\n"
         f"💎 Баланс: <code>{balance}</code> баллов\n"
+        f"🌟 Голда: <code>{gold}</code>\n"
         f"🛒 Покупок: <code>{purchases}</code>\n"
         f"👥 Рефералов: <code>{ref_count}</code>\n\n"
         f"🔗 Твоя ссылка:\n<code>{ref_link}</code>\n\n"
@@ -245,6 +298,7 @@ def main_keyboard():
         [InlineKeyboardButton(text="🛒 Магазин", callback_data="shop")],
         [InlineKeyboardButton(text="🎁 Ввести промокод", callback_data="enter_promo")],
         [InlineKeyboardButton(text="📋 Задания", callback_data="tasks")],
+        [InlineKeyboardButton(text="💸 Вывод средств", callback_data="withdraw")],
     ])
 
 
@@ -253,6 +307,8 @@ def shop_keyboard():
         [InlineKeyboardButton(text="🎰 Кейс Миг Удачи — 25", callback_data="buy_case")],
         [InlineKeyboardButton(text="💎 100 GOLD — 65", callback_data="buy_gold100")],
         [InlineKeyboardButton(text="💎 1000 GOLD — 600", callback_data="buy_gold1000")],
+        [InlineKeyboardButton(text="✊ Камень-ножницы-бумага — 3", callback_data="game_rps")],
+        [InlineKeyboardButton(text="🔢 Угадай число — 3", callback_data="game_guess")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")],
     ])
 
@@ -282,6 +338,7 @@ def admin_keyboard():
         [InlineKeyboardButton(text="➕ Создать промокод", callback_data="admin_create_promo")],
         [InlineKeyboardButton(text="📋 Список промокодов", callback_data="admin_list_promos")],
         [InlineKeyboardButton(text="💰 Изменить баланс", callback_data="admin_set_balance")],
+        [InlineKeyboardButton(text="💸 Заявки на вывод", callback_data="admin_withdrawals")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")],
     ])
@@ -292,10 +349,40 @@ def reply_menu():
         keyboard=[
             [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="🛒 Магазин")],
             [KeyboardButton(text="🎁 Бонус"), KeyboardButton(text="📋 Задания")],
+            [KeyboardButton(text="💸 Вывод"), KeyboardButton(text="❓ Помощь")],
         ],
         resize_keyboard=True,
         is_persistent=True,
     )
+
+
+def rps_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✊ Камень", callback_data="rps_rock"),
+            InlineKeyboardButton(text="✋ Бумага", callback_data="rps_paper"),
+            InlineKeyboardButton(text="✌️ Ножницы", callback_data="rps_scissors"),
+        ],
+    ])
+
+
+def guess_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="1", callback_data="guess_1"),
+            InlineKeyboardButton(text="2", callback_data="guess_2"),
+            InlineKeyboardButton(text="3", callback_data="guess_3"),
+            InlineKeyboardButton(text="4", callback_data="guess_4"),
+            InlineKeyboardButton(text="5", callback_data="guess_5"),
+        ],
+        [
+            InlineKeyboardButton(text="6", callback_data="guess_6"),
+            InlineKeyboardButton(text="7", callback_data="guess_7"),
+            InlineKeyboardButton(text="8", callback_data="guess_8"),
+            InlineKeyboardButton(text="9", callback_data="guess_9"),
+            InlineKeyboardButton(text="10", callback_data="guess_10"),
+        ],
+    ])
 
 
 # ==== АНТИФЛУД ====
@@ -306,6 +393,13 @@ def is_flooding(user_id: int) -> bool:
         return True
     LAST_CLICK[user_id] = now
     return False
+
+
+def game_cooldown_left(user_id: int) -> int:
+    now = time.time()
+    last = LAST_GAME.get(user_id, 0)
+    left = GAME_COOLDOWN - (now - last)
+    return int(left) if left > 0 else 0
 
 
 # ==== СТАРТ / АДМИН-КОМАНДЫ ====
@@ -376,12 +470,15 @@ async def btn_profile(message: Message):
 async def btn_shop(message: Message):
     u = db_get_user(message.from_user.id)
     balance = u[0] if u else 0
+    gold = u[8] if u else 0
     text = (
         f"🛒 <b>МАГАЗИН</b>\n{DIVIDER}"
-        f"💎 Твой баланс: <code>{balance}</code> баллов\n\n"
+        f"💎 Твой баланс: <code>{balance}</code> баллов\n"
+        f"🌟 Голда: <code>{gold}</code>\n\n"
         f"🎰 <b>Кейс Миг Удачи</b> — 25 баллов\n"
         f"💎 <b>100 GOLD</b> — 65 баллов\n"
-        f"💎 <b>1000 GOLD</b> — 600 баллов"
+        f"💎 <b>1000 GOLD</b> — 600 баллов\n\n"
+        f"🎮 <b>Мини-игры</b> — 3 балла за игру"
     )
     await message.answer(text, reply_markup=shop_keyboard())
 
@@ -411,6 +508,32 @@ async def btn_daily_bonus(message: Message):
     db_add_balance(user_id, reward)
     db_set_last_bonus(user_id, now)
     await message.answer(f"🎁 Ежедневный бонус: <b>+{reward}</b> баллов!\nПриходи через 24 часа.")
+
+
+@dp.message(F.text == "💸 Вывод")
+async def btn_withdraw(message: Message):
+    await message.answer(
+        "💸 <b>Вывод средств</b>\n\n"
+        "Курс: <b>1 балл = 1 ₽</b>\n"
+        "Минимум: <b>100 баллов</b>\n\n"
+        "Отправь одним сообщением: <code>сумма реквизиты</code>\n"
+        "Пример: <code>100 2200123456789012</code>",
+        reply_markup=reply_menu(),
+    )
+
+
+@dp.message(F.text == "❓ Помощь")
+async def btn_help(message: Message):
+    await message.answer(
+        f"{HEADER}{DIVIDER}❓ <b>Помощь</b>\n{DIVIDER}"
+        f"• <b>👤 Профиль</b> — баланс, голда, рефералы\n"
+        f"• <b>🛒 Магазин</b> — кейс, GOLD, мини-игры\n"
+        f"• <b>🎁 Бонус</b> — раз в 24 часа, 3–5 баллов\n"
+        f"• <b>📋 Задания</b> — подписки за баллы\n"
+        f"• <b>💸 Вывод</b> — обмен баллов на рубли (1:1), минимум 100\n\n"
+        f"Админ-команды: /admin",
+        reply_markup=reply_menu(),
+    )
 
 
 # ==== ИНЛАЙН-ХЕНДЛЕРЫ ====
@@ -444,15 +567,30 @@ async def open_tasks(callback: CallbackQuery):
 async def open_shop(callback: CallbackQuery):
     u = db_get_user(callback.from_user.id)
     balance = u[0] if u else 0
+    gold = u[8] if u else 0
     text = (
         f"🛒 <b>МАГАЗИН</b>\n{DIVIDER}"
-        f"💎 Твой баланс: <code>{balance}</code> баллов\n\n"
+        f"💎 Твой баланс: <code>{balance}</code> баллов\n"
+        f"🌟 Голда: <code>{gold}</code>\n\n"
         f"🎰 <b>Кейс Миг Удачи</b> — 25 баллов (от 1 до 50)\n"
         f"💎 <b>100 GOLD</b> — 65 баллов\n"
         f"💎 <b>1000 GOLD</b> — 600 баллов\n\n"
+        f"🎮 <b>Мини-игры</b> — 3 балла за игру\n\n"
         f"Выбери товар 👇"
     )
     await callback.message.edit_text(text, reply_markup=shop_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "withdraw")
+async def open_withdraw(callback: CallbackQuery):
+    await callback.message.answer(
+        "💸 <b>Вывод средств</b>\n\n"
+        "Курс: <b>1 балл = 1 ₽</b>\n"
+        "Минимум: <b>100 баллов</b>\n\n"
+        "Отправь одним сообщением: <code>сумма реквизиты</code>\n"
+        "Пример: <code>100 2200123456789012</code>",
+    )
     await callback.answer()
 
 
@@ -503,10 +641,11 @@ async def _buy_gold(callback: CallbackQuery, gold: int, price: int):
         return
     db_add_balance(callback.from_user.id, -price)
     db_add_purchase(callback.from_user.id)
+    db_add_gold(callback.from_user.id, gold)
     await callback.answer(f"✅ Куплено {gold} GOLD", show_alert=True)
     await callback.message.edit_text(
         f"🛒 <b>Покупка</b>\n{DIVIDER}"
-        f"💎 {gold} GOLD\n"
+        f"🌟 {gold} GOLD\n"
         f"💸 Списано: <code>{price}</code> баллов\n"
         f"💰 Остаток: <code>{balance - price}</code>\n\n"
         f"⚠️ Выдача GOLD производится вручную администратором.",
@@ -583,6 +722,148 @@ async def process_task_twitch(callback: CallbackQuery):
     )
 
 
+# ==== ИГРЫ ====
+@dp.callback_query(F.data == "game_rps")
+async def game_rps_start(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    left = game_cooldown_left(user_id)
+    if left > 0:
+        await callback.answer(f"⏳ Подожди {left} сек.", show_alert=True)
+        return
+    u = db_get_user(user_id)
+    balance = u[0] if u else 0
+    if balance < 3:
+        await callback.answer(f"❌ Нужно 3 балла для игры. У тебя {balance}.", show_alert=True)
+        return
+    db_add_balance(user_id, -3)
+    await callback.message.edit_text(
+        f"✊✋✌️ <b>Камень-ножницы-бумага</b>\n{DIVIDER}"
+        f"💸 Списано: <b>3</b> балла\n"
+        f"Выбери свой вариант. Победа — <b>+3</b> балла.",
+        reply_markup=rps_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.in_({"rps_rock", "rps_paper", "rps_scissors"}))
+async def game_rps_play(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    left = game_cooldown_left(user_id)
+    if left > 0:
+        await callback.answer(f"⏳ Подожди {left} сек.", show_alert=True)
+        return
+
+    choices = {"rps_rock": "✊ Камень", "rps_paper": "✋ Бумага", "rps_scissors": "✌️ Ножницы"}
+    user_choice = callback.data
+    bot_choice = random.choice(list(choices.keys()))
+    beats = {"rps_rock": "rps_scissors", "rps_paper": "rps_rock", "rps_scissors": "rps_paper"}
+
+    if user_choice == bot_choice:
+        result = "🤝 Ничья!"
+        reward = 0
+    elif beats[user_choice] == bot_choice:
+        result = "🎉 Ты победил!"
+        reward = 3
+    else:
+        result = "😢 Ты проиграл"
+        reward = 0
+
+    if reward:
+        db_add_balance(user_id, reward)
+
+    LAST_GAME[user_id] = time.time()
+
+    await callback.message.edit_text(
+        f"✊✋✌️ <b>Камень-ножницы-бумага</b>\n{DIVIDER}"
+        f"Ты: <b>{choices[user_choice]}</b>\n"
+        f"Бот: <b>{choices[bot_choice]}</b>\n\n"
+        f"{result}" + (f"\n💎 +{reward} баллов" if reward else ""),
+        reply_markup=shop_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "game_guess")
+async def game_guess_start(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    left = game_cooldown_left(user_id)
+    if left > 0:
+        await callback.answer(f"⏳ Подожди {left} сек.", show_alert=True)
+        return
+    u = db_get_user(user_id)
+    balance = u[0] if u else 0
+    if balance < 3:
+        await callback.answer(f"❌ Нужно 3 балла для игры. У тебя {balance}.", show_alert=True)
+        return
+    db_add_balance(user_id, -3)
+    await callback.message.edit_text(
+        f"🔢 <b>Угадай число</b>\n{DIVIDER}"
+        f"💸 Списано: <b>3</b> балла\n"
+        f"Я загадал число от <b>1 до 10</b>.\n"
+        f"Угадаешь — <b>+5</b> баллов.",
+        reply_markup=guess_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("guess_"))
+async def game_guess_play(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    left = game_cooldown_left(user_id)
+    if left > 0:
+        await callback.answer(f"⏳ Подожди {left} сек.", show_alert=True)
+        return
+
+    try:
+        user_num = int(callback.data.split("_")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Ошибка", show_alert=True)
+        return
+
+    secret = random.randint(1, 10)
+    LAST_GAME[user_id] = time.time()
+
+    if user_num == secret:
+        db_add_balance(user_id, 5)
+        result = f"🎉 Угадал! Число было <b>{secret}</b>.\n💎 +5 баллов"
+    else:
+        result = f"😢 Не угадал. Число было <b>{secret}</b>."
+
+    await callback.message.edit_text(
+        f"🔢 <b>Угадай число</b>\n{DIVIDER}"
+        f"Твой выбор: <b>{user_num}</b>\n\n"
+        f"{result}",
+        reply_markup=shop_keyboard(),
+    )
+    await callback.answer()
+
+
+# ==== ВЫВОД СРЕДСТВ ====
+@dp.message(F.text.regexp(r"^\d+\s+.+$"))
+async def handle_withdraw_request(message: Message):
+    parts = message.text.split(maxsplit=1)
+    try:
+        amount = int(parts[0])
+        details = parts[1]
+    except (ValueError, IndexError):
+        return
+    if amount < 100:
+        await message.answer("❌ Минимум для вывода — 100 баллов.")
+        return
+    u = db_get_user(message.from_user.id)
+    balance = u[0] if u else 0
+    if balance < amount:
+        await message.answer(f"❌ Недостаточно баллов. У тебя {balance}.")
+        return
+    db_create_withdrawal(message.from_user.id, amount, details)
+    await message.answer(
+        f"✅ Заявка на вывод <b>{amount} ₽</b> создана.\n"
+        f"Реквизиты: <code>{details}</code>\n\n"
+        f"Администратор обработает её в ближайшее время.",
+        reply_markup=reply_menu(),
+    )
+
+
 # ==== ПРОМОКОДЫ ====
 @dp.callback_query(F.data == "enter_promo")
 async def enter_promo(callback: CallbackQuery):
@@ -590,7 +871,7 @@ async def enter_promo(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.message(F.text & ~F.text.startswith("/") & ~F.text.startswith("👤") & ~F.text.startswith("🛒") & ~F.text.startswith("🎁") & ~F.text.startswith("📋"))
+@dp.message(F.text & ~F.text.startswith("/") & ~F.text.startswith("👤") & ~F.text.startswith("🛒") & ~F.text.startswith("🎁") & ~F.text.startswith("📋") & ~F.text.startswith("💸") & ~F.text.startswith("❓"))
 async def handle_text(message: Message):
     text = message.text.strip().upper()
     if " " in text:
@@ -643,6 +924,45 @@ async def admin_set_balance(callback: CallbackQuery):
         return
     await callback.message.answer("Формат: <code>/balance user_id сумма</code>\nПример: <code>/balance 123456789 100</code>")
     await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_withdrawals")
+async def admin_withdrawals(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔", show_alert=True)
+        return
+    rows = db_get_pending_withdrawals()
+    if not rows:
+        await callback.message.answer("Заявок на вывод нет.")
+        await callback.answer()
+        return
+    for wid, uid, amount, details in rows:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Выполнено", callback_data=f"wdone_{wid}")]
+        ])
+        await callback.message.answer(
+            f"💸 <b>Заявка #{wid}</b>\n"
+            f"Пользователь: <code>{uid}</code>\n"
+            f"Сумма: <b>{amount} ₽</b>\n"
+            f"Реквизиты: <code>{details}</code>",
+            reply_markup=kb,
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("wdone_"))
+async def admin_complete_withdrawal(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔", show_alert=True)
+        return
+    try:
+        wid = int(callback.data.split("_")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    db_complete_withdrawal(wid)
+    await callback.message.edit_text(callback.message.text + "\n\n✅ <b>Выполнено</b>")
+    await callback.answer("Заявка закрыта, баллы списаны")
 
 
 @dp.callback_query(F.data == "admin_stats")
