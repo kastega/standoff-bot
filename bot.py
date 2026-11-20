@@ -269,7 +269,8 @@ def tasks_keyboard(user_id: int) -> InlineKeyboardMarkup:
     if not video_done:
         rows.append([InlineKeyboardButton(text="👀 Посмотреть видео  +3", callback_data="task_video")])
     if not twitch_done:
-        rows.append([InlineKeyboardButton(text="🟣 Подписаться на Twitch  +5", callback_data="task_twitch")])
+                rows.append([InlineKeyboardButton(text="🟣 Перейти на Twitch", url="https://www.twitch.tv/kastega")])
+        rows.append([InlineKeyboardButton(text="✅ Я подписался (+5)", callback_data="task_twitch")])
     if not rows:
         rows.append([InlineKeyboardButton(text="✅ Все задания выполнены", callback_data="noop")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back")])
