@@ -44,7 +44,7 @@ CLICK_COOLDOWN = 2
 
 HEADER = "🎮 <b>STANDOFF 2 — БОТ ЗАДАНИЙ</b>\n"
 DIVIDER = "━━━━━━━━━━━━━━━━━━━━\n"
-BOT_USERNAME = "your_bot"  # заполнится при запуске через get_me()
+BOT_USERNAME = "your_bot"
 
 
 # ==== БАЗА ДАННЫХ ====
@@ -63,7 +63,9 @@ def db_init():
             video_done INTEGER DEFAULT 0,
             purchases INTEGER DEFAULT 0,
             referrer_id INTEGER DEFAULT NULL,
-            ref_count INTEGER DEFAULT 0
+            ref_count INTEGER DEFAULT 0,
+            twitch_done INTEGER DEFAULT 0,
+            last_bonus INTEGER DEFAULT 0
         )
     """)
     cur.execute("""
@@ -88,7 +90,8 @@ def db_get_user(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "SELECT balance, sub_done, video_done, purchases, referrer_id, ref_count FROM users WHERE user_id = ?",
+        "SELECT balance, sub_done, video_done, purchases, referrer_id, ref_count, twitch_done, last_bonus "
+        "FROM users WHERE user_id = ?",
         (user_id,),
     )
     row = cur.fetchone()
@@ -133,6 +136,16 @@ def db_mark_task(user_id: int, task: str):
         cur.execute("UPDATE users SET sub_done = 1 WHERE user_id = ?", (user_id,))
     elif task == "video":
         cur.execute("UPDATE users SET video_done = 1 WHERE user_id = ?", (user_id,))
+    elif task == "twitch":
+        cur.execute("UPDATE users SET twitch_done = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def db_set_last_bonus(user_id: int, ts: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET last_bonus = ? WHERE user_id = ?", (ts, user_id))
     conn.commit()
     conn.close()
 
@@ -229,10 +242,9 @@ def profile_text(user_id: int) -> str:
 def main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
-        [InlineKeyboardButton(text="📺 Подписаться на канал  +5", callback_data="task_sub")],
-        [InlineKeyboardButton(text="👀 Посмотреть видео  +3", callback_data="task_video")],
         [InlineKeyboardButton(text="🛒 Магазин", callback_data="shop")],
         [InlineKeyboardButton(text="🎁 Ввести промокод", callback_data="enter_promo")],
+        [InlineKeyboardButton(text="📋 Задания", callback_data="tasks")],
     ])
 
 
@@ -243,6 +255,25 @@ def shop_keyboard():
         [InlineKeyboardButton(text="💎 1000 GOLD — 600", callback_data="buy_gold1000")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")],
     ])
+
+
+def tasks_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    u = db_get_user(user_id)
+    sub_done = u[1] if u else 0
+    video_done = u[2] if u else 0
+    twitch_done = u[6] if u else 0
+
+    rows = []
+    if not sub_done:
+        rows.append([InlineKeyboardButton(text="📺 Подписаться на канал  +5", callback_data="task_sub")])
+    if not video_done:
+        rows.append([InlineKeyboardButton(text="👀 Посмотреть видео  +3", callback_data="task_video")])
+    if not twitch_done:
+        rows.append([InlineKeyboardButton(text="🟣 Подписаться на Twitch  +5", callback_data="task_twitch")])
+    if not rows:
+        rows.append([InlineKeyboardButton(text="✅ Все задания выполнены", callback_data="noop")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_keyboard():
@@ -259,7 +290,7 @@ def reply_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="🛒 Магазин")],
-            [KeyboardButton(text="🎁 Промокод"), KeyboardButton(text="📋 Задания")],
+            [KeyboardButton(text="🎁 Бонус"), KeyboardButton(text="📋 Задания")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -354,20 +385,31 @@ async def btn_shop(message: Message):
     await message.answer(text, reply_markup=shop_keyboard())
 
 
-@dp.message(F.text == "🎁 Промокод")
-async def btn_promo(message: Message):
-    await message.answer("Введи промокод сообщением:")
-
-
 @dp.message(F.text == "📋 Задания")
 async def btn_tasks(message: Message):
     await message.answer(
         f"{HEADER}{DIVIDER}📋 <b>Задания</b>\n{DIVIDER}Выбери задание:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📺 Подписаться на канал  +5", callback_data="task_sub")],
-            [InlineKeyboardButton(text="👀 Посмотреть видео  +3", callback_data="task_video")],
-        ]),
+        reply_markup=tasks_keyboard(message.from_user.id),
     )
+
+
+@dp.message(F.text == "🎁 Бонус")
+async def btn_daily_bonus(message: Message):
+    user_id = message.from_user.id
+    db_add_user(user_id, message.from_user.username)
+    u = db_get_user(user_id)
+    last = u[7] if u else 0
+    now = int(time.time())
+    if now - last < 86400:
+        remaining = 86400 - (now - last)
+        hours = remaining // 3600
+        minutes = (remaining % 3600) // 60
+        await message.answer(f"⏳ Бонус уже получен. Следующий через <b>{hours} ч {minutes} мин</b>.")
+        return
+    reward = random.randint(3, 5)
+    db_add_balance(user_id, reward)
+    db_set_last_bonus(user_id, now)
+    await message.answer(f"🎁 Ежедневный бонус: <b>+{reward}</b> баллов!\nПриходи через 24 часа.")
 
 
 # ==== ИНЛАЙН-ХЕНДЛЕРЫ ====
@@ -377,9 +419,23 @@ async def back_to_main(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "noop")
+async def noop(callback: CallbackQuery):
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "profile")
 async def show_profile(callback: CallbackQuery):
     await callback.message.edit_text(profile_text(callback.from_user.id), reply_markup=main_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "tasks")
+async def open_tasks(callback: CallbackQuery):
+    await callback.message.edit_text(
+        f"{HEADER}{DIVIDER}📋 <b>Задания</b>\n{DIVIDER}Выбери задание:",
+        reply_markup=tasks_keyboard(callback.from_user.id),
+    )
     await callback.answer()
 
 
@@ -454,6 +510,75 @@ async def _buy_gold(callback: CallbackQuery, gold: int, price: int):
         f"💰 Остаток: <code>{balance - price}</code>\n\n"
         f"⚠️ Выдача GOLD производится вручную администратором.",
         reply_markup=shop_keyboard(),
+    )
+
+
+# ==== ЗАДАНИЯ ====
+@dp.callback_query(F.data == "task_sub")
+async def process_task_sub(callback: CallbackQuery):
+    if is_flooding(callback.from_user.id):
+        await callback.answer("⏳ Не так быстро", show_alert=True)
+        return
+    user_id = callback.from_user.id
+    db_add_user(user_id, callback.from_user.username)
+    u = db_get_user(user_id)
+    if u and u[1] == 1:
+        await callback.answer("✅ Ты уже подписан на канал — задание выполнено", show_alert=True)
+        return
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        if member.status in ("member", "administrator", "creator"):
+            db_mark_task(user_id, "sub")
+            db_add_balance(user_id, 5)
+            await callback.answer("🎉 +5 баллов за подписку!", show_alert=True)
+            await callback.message.edit_text(
+                f"{HEADER}{DIVIDER}📋 <b>Задания</b>\n{DIVIDER}Выбери задание:",
+                reply_markup=tasks_keyboard(user_id),
+            )
+        else:
+            await callback.answer("❌ Ты ещё не подписан на канал", show_alert=True)
+    except Exception as e:
+        logging.error(f"Ошибка проверки подписки: {e}")
+        await callback.answer("⚠️ Не удалось проверить подписку. Проверь настройки канала.", show_alert=True)
+
+
+@dp.callback_query(F.data == "task_video")
+async def process_task_video(callback: CallbackQuery):
+    if is_flooding(callback.from_user.id):
+        await callback.answer("⏳ Не так быстро", show_alert=True)
+        return
+    user_id = callback.from_user.id
+    db_add_user(user_id, callback.from_user.username)
+    u = db_get_user(user_id)
+    if u and u[2] == 1:
+        await callback.answer("✅ Ты уже выполнил это задание", show_alert=True)
+        return
+    db_mark_task(user_id, "video")
+    db_add_balance(user_id, 3)
+    await callback.answer("🎉 +3 балла за видео!", show_alert=True)
+    await callback.message.edit_text(
+        f"{HEADER}{DIVIDER}📋 <b>Задания</b>\n{DIVIDER}Выбери задание:",
+        reply_markup=tasks_keyboard(user_id),
+    )
+
+
+@dp.callback_query(F.data == "task_twitch")
+async def process_task_twitch(callback: CallbackQuery):
+    if is_flooding(callback.from_user.id):
+        await callback.answer("⏳ Не так быстро", show_alert=True)
+        return
+    user_id = callback.from_user.id
+    db_add_user(user_id, callback.from_user.username)
+    u = db_get_user(user_id)
+    if u and u[6] == 1:
+        await callback.answer("✅ Ты уже подписан на Twitch — задание выполнено", show_alert=True)
+        return
+    db_mark_task(user_id, "twitch")
+    db_add_balance(user_id, 5)
+    await callback.answer("🎉 +5 баллов за подписку на Twitch!", show_alert=True)
+    await callback.message.edit_text(
+        f"{HEADER}{DIVIDER}📋 <b>Задания</b>\n{DIVIDER}Выбери задание:",
+        reply_markup=tasks_keyboard(user_id),
     )
 
 
