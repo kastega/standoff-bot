@@ -27,7 +27,7 @@ _admin_env = os.getenv("ADMIN_IDS", "")
 if _admin_env:
     ADMIN_IDS = {int(x) for x in _admin_env.split(",") if x.strip().isdigit()}
 else:
-    ADMIN_IDS = {123456789}  # <-- замените на ваш ID
+    ADMIN_IDS = {123456789}  # <-- замените на ваш ID, если не задан на Railway
 
 if not BOT_TOKEN:
     raise SystemExit(
@@ -269,7 +269,7 @@ def tasks_keyboard(user_id: int) -> InlineKeyboardMarkup:
     if not video_done:
         rows.append([InlineKeyboardButton(text="👀 Посмотреть видео  +3", callback_data="task_video")])
     if not twitch_done:
-                rows.append([InlineKeyboardButton(text="🟣 Перейти на Twitch", url="https://www.twitch.tv/kastega")])
+        rows.append([InlineKeyboardButton(text="🟣 Перейти на Twitch", url="https://www.twitch.tv/kastega")])
         rows.append([InlineKeyboardButton(text="✅ Я подписался (+5)", callback_data="task_twitch")])
     if not rows:
         rows.append([InlineKeyboardButton(text="✅ Все задания выполнены", callback_data="noop")])
