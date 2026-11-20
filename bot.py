@@ -40,6 +40,7 @@ LAST_CLICK = {}
 CLICK_COOLDOWN = 2
 GAME_COOLDOWN = 30
 LAST_GAME = {}
+HILO_CURRENT = {}
 
 HEADER = "🎮 <b>STANDOFF 2 — БОТ ЗАДАНИЙ</b>\n"
 DIVIDER = "━━━━━━━━━━━━━━━━━━━━\n"
@@ -309,6 +310,8 @@ def shop_keyboard():
         [InlineKeyboardButton(text="💎 1000 GOLD — 600", callback_data="buy_gold1000")],
         [InlineKeyboardButton(text="✊ Камень-ножницы-бумага — 3", callback_data="game_rps")],
         [InlineKeyboardButton(text="🔢 Угадай число — 3", callback_data="game_guess")],
+        [InlineKeyboardButton(text="🎲 Кости — 3", callback_data="game_dice")],
+        [InlineKeyboardButton(text="🔢 Больше-меньше — 3", callback_data="game_hilo")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")],
     ])
 
@@ -381,6 +384,15 @@ def guess_keyboard():
             InlineKeyboardButton(text="8", callback_data="guess_8"),
             InlineKeyboardButton(text="9", callback_data="guess_9"),
             InlineKeyboardButton(text="10", callback_data="guess_10"),
+        ],
+    ])
+
+
+def hilo_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⬆️ Больше", callback_data="hilo_more"),
+            InlineKeyboardButton(text="⬇️ Меньше", callback_data="hilo_less"),
         ],
     ])
 
@@ -832,6 +844,99 @@ async def game_guess_play(callback: CallbackQuery):
     await callback.message.edit_text(
         f"🔢 <b>Угадай число</b>\n{DIVIDER}"
         f"Твой выбор: <b>{user_num}</b>\n\n"
+        f"{result}",
+        reply_markup=shop_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "game_dice")
+async def game_dice_start(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    left = game_cooldown_left(user_id)
+    if left > 0:
+        await callback.answer(f"⏳ Подожди {left} сек.", show_alert=True)
+        return
+    u = db_get_user(user_id)
+    balance = u[0] if u else 0
+    if balance < 3:
+        await callback.answer(f"❌ Нужно 3 балла для игры. У тебя {balance}.", show_alert=True)
+        return
+    db_add_balance(user_id, -3)
+    user_roll = random.randint(1, 6)
+    bot_roll = random.randint(1, 6)
+    LAST_GAME[user_id] = time.time()
+
+    if user_roll > bot_roll:
+        db_add_balance(user_id, 6)
+        result = "🎉 Ты победил! +3 балла (банк 6)"
+    elif user_roll < bot_roll:
+        result = "😢 Ты проиграл. Ставка 3 балла потеряна."
+    else:
+        db_add_balance(user_id, 3)
+        result = "🤝 Ничья! Ставка возвращена."
+
+    await callback.message.edit_text(
+        f"🎲 <b>Кости</b>\n{DIVIDER}"
+        f"Ты: <b>{user_roll}</b>  |  Бот: <b>{bot_roll}</b>\n\n"
+        f"{result}",
+        reply_markup=shop_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "game_hilo")
+async def game_hilo_start(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    left = game_cooldown_left(user_id)
+    if left > 0:
+        await callback.answer(f"⏳ Подожди {left} сек.", show_alert=True)
+        return
+    u = db_get_user(user_id)
+    balance = u[0] if u else 0
+    if balance < 3:
+        await callback.answer(f"❌ Нужно 3 балла для игры. У тебя {balance}.", show_alert=True)
+        return
+    db_add_balance(user_id, -3)
+    current = random.randint(1, 100)
+    HILO_CURRENT[user_id] = current
+    await callback.message.edit_text(
+        f"🔢 <b>Больше-меньше</b>\n{DIVIDER}"
+        f"💸 Списано: <b>3</b> балла\n"
+        f"Текущее число: <b>{current}</b>\n\n"
+        f"Следующее будет больше или меньше? Победа — <b>+5</b> баллов.",
+        reply_markup=hilo_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.in_({"hilo_more", "hilo_less"}))
+async def game_hilo_play(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    left = game_cooldown_left(user_id)
+    if left > 0:
+        await callback.answer(f"⏳ Подожди {left} сек.", show_alert=True)
+        return
+    current = HILO_CURRENT.get(user_id)
+    if current is None:
+        await callback.answer("Начни игру заново", show_alert=True)
+        return
+
+    next_num = random.randint(1, 100)
+    guess_more = callback.data == "hilo_more"
+    win = (next_num > current and guess_more) or (next_num < current and not guess_more)
+
+    if win:
+        db_add_balance(user_id, 5)
+        result = f"🎉 Угадал! Было {current}, стало {next_num}. +5 баллов"
+    else:
+        result = f"😢 Не угадал. Было {current}, стало {next_num}."
+
+    LAST_GAME[user_id] = time.time()
+    HILO_CURRENT.pop(user_id, None)
+
+    await callback.message.edit_text(
+        f"🔢 <b>Больше-меньше</b>\n{DIVIDER}"
         f"{result}",
         reply_markup=shop_keyboard(),
     )
