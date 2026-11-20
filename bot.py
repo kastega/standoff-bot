@@ -91,6 +91,15 @@ def db_init():
             created_at INTEGER
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS deposits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount INTEGER,
+            status TEXT DEFAULT 'pending',
+            created_at INTEGER
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -118,6 +127,7 @@ def db_add_user(user_id: int, username: str, referrer_id: int = None):
         if r and r[0] is None:
             cur.execute("UPDATE users SET referrer_id = ? WHERE user_id = ?", (referrer_id, user_id))
             cur.execute("UPDATE users SET ref_count = ref_count + 1, balance = balance + 5 WHERE user_id = ?", (referrer_id,))
+            cur.execute("UPDATE users SET balance = balance + 3 WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
 
@@ -261,6 +271,39 @@ def db_complete_withdrawal(withdrawal_id: int):
     conn.close()
 
 
+def db_create_deposit(user_id: int, amount: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO deposits (user_id, amount, created_at) VALUES (?, ?, ?)",
+        (user_id, amount, int(time.time())),
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_get_pending_deposits():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id, user_id, amount FROM deposits WHERE status = 'pending' ORDER BY id")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def db_complete_deposit(deposit_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, amount FROM deposits WHERE id = ? AND status = 'pending'", (deposit_id,))
+    row = cur.fetchone()
+    if row:
+        user_id, amount = row
+        cur.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+        cur.execute("UPDATE deposits SET status = 'done' WHERE id = ?", (deposit_id,))
+    conn.commit()
+    conn.close()
+
+
 # ==== ОФОРМЛЕНИЕ ====
 def profile_text(user_id: int) -> str:
     u = db_get_user(user_id)
@@ -330,6 +373,7 @@ def admin_keyboard():
         [InlineKeyboardButton(text="➕ Создать промокод", callback_data="admin_create_promo")],
         [InlineKeyboardButton(text="📋 Список промокодов", callback_data="admin_list_promos")],
         [InlineKeyboardButton(text="💰 Изменить баланс", callback_data="admin_set_balance")],
+        [InlineKeyboardButton(text="💳 Заявки на депозит", callback_data="admin_deposits")],
         [InlineKeyboardButton(text="💸 Заявки на вывод", callback_data="admin_withdrawals")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")],
@@ -341,7 +385,8 @@ def reply_menu():
         keyboard=[
             [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="🛒 Магазин")],
             [KeyboardButton(text="🎁 Бонус"), KeyboardButton(text="📋 Задания")],
-            [KeyboardButton(text="💸 Вывод"), KeyboardButton(text="❓ Помощь")],
+            [KeyboardButton(text="💳 Депозит"), KeyboardButton(text="💸 Вывод")],
+            [KeyboardButton(text="❓ Помощь")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -504,6 +549,17 @@ async def btn_daily_bonus(message: Message):
     await message.answer(f"🎁 Ежедневный бонус: <b>+{reward}</b> баллов!\nПриходи через 24 часа.")
 
 
+@dp.message(F.text == "💳 Депозит")
+async def btn_deposit(message: Message):
+    await message.answer(
+        "💳 <b>Пополнение баланса</b>\n\n"
+        "Отправь сумму пополнения в баллах одним сообщением.\n"
+        "Пример: <code>100</code>\n\n"
+        "После создания заявки администратор подтвердит платёж, и баллы будут начислены.",
+        reply_markup=reply_menu(),
+    )
+
+
 @dp.message(F.text == "💸 Вывод")
 async def btn_withdraw(message: Message):
     await message.answer(
@@ -524,6 +580,7 @@ async def btn_help(message: Message):
         f"• <b>🛒 Магазин</b> — кейс, GOLD, мини-игры\n"
         f"• <b>🎁 Бонус</b> — раз в 24 часа, 3–5 баллов\n"
         f"• <b>📋 Задания</b> — подписки за баллы\n"
+        f"• <b>💳 Депозит</b> — заявка на пополнение\n"
         f"• <b>💸 Вывод</b> — обмен баллов на рубли (1:1), минимум 100\n\n"
         f"Админ-команды: /admin",
         reply_markup=reply_menu(),
@@ -904,7 +961,27 @@ async def game_hilo_play(callback: CallbackQuery):
     await callback.answer()
 
 
-# ==== ВЫВОД СРЕДСТВ ====
+# ==== ДЕПОЗИТ И ВЫВОД ====
+@dp.message(F.text.regexp(r"^\d+$"))
+async def handle_deposit_amount(message: Message):
+    try:
+        amount = int(message.text.strip())
+    except ValueError:
+        return
+    if amount < 10:
+        await message.answer("❌ Минимум для пополнения — 10 баллов.")
+        return
+    if amount > 100000:
+        await message.answer("❌ Максимум — 100 000 баллов.")
+        return
+    db_create_deposit(message.from_user.id, amount)
+    await message.answer(
+        f"✅ Заявка на пополнение <b>{amount}</b> баллов создана.\n"
+        f"Администратор подтвердит её после оплаты.",
+        reply_markup=reply_menu(),
+    )
+
+
 @dp.message(F.text.regexp(r"^\d+\s+.+$"))
 async def handle_withdraw_request(message: Message):
     parts = message.text.split(maxsplit=1)
@@ -937,7 +1014,7 @@ async def enter_promo(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.message(F.text & ~F.text.startswith("/") & ~F.text.startswith("👤") & ~F.text.startswith("🛒") & ~F.text.startswith("🎁") & ~F.text.startswith("📋") & ~F.text.startswith("💸") & ~F.text.startswith("❓"))
+@dp.message(F.text & ~F.text.startswith("/") & ~F.text.startswith("👤") & ~F.text.startswith("🛒") & ~F.text.startswith("🎁") & ~F.text.startswith("📋") & ~F.text.startswith("💳") & ~F.text.startswith("💸") & ~F.text.startswith("❓"))
 async def handle_text(message: Message):
     text = message.text.strip().upper()
     if " " in text:
@@ -990,6 +1067,44 @@ async def admin_set_balance(callback: CallbackQuery):
         return
     await callback.message.answer("Формат: <code>/balance user_id сумма</code>\nПример: <code>/balance 123456789 100</code>")
     await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_deposits")
+async def admin_deposits(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔", show_alert=True)
+        return
+    rows = db_get_pending_deposits()
+    if not rows:
+        await callback.message.answer("Заявок на депозит нет.")
+        await callback.answer()
+        return
+    for did, uid, amount in rows:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"ddone_{did}")]
+        ])
+        await callback.message.answer(
+            f"💳 <b>Депозит #{did}</b>\n"
+            f"Пользователь: <code>{uid}</code>\n"
+            f"Сумма: <b>{amount}</b> баллов",
+            reply_markup=kb,
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("ddone_"))
+async def admin_complete_deposit(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔", show_alert=True)
+        return
+    try:
+        did = int(callback.data.split("_")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    db_complete_deposit(did)
+    await callback.message.edit_text(callback.message.text + "\n\n✅ <b>Подтверждено, баллы начислены</b>")
+    await callback.answer("Депозит подтверждён")
 
 
 @dp.callback_query(F.data == "admin_withdrawals")
