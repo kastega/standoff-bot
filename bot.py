@@ -1,398 +1,3 @@
-import asyncio
-import logging
-import os
-import random
-import time
-import sqlite3
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-)
-
-# ==== НАСТРОЙКИ ====
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DB_PATH = os.getenv("DB_PATH", "bot.db")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@your_channel")
-
-_admin_env = os.getenv("ADMIN_IDS", "")
-if _admin_env:
-    ADMIN_IDS = {int(x) for x in _admin_env.split(",") if x.strip().isdigit()}
-else:
-    ADMIN_IDS = {123456789}
-
-if not BOT_TOKEN:
-    raise SystemExit("Не задан BOT_TOKEN.")
-
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
-
-LAST_CLICK = {}
-CLICK_COOLDOWN = 2
-HILO_CURRENT = {}
-
-HEADER = "🎮 <b>STANDOFF 2 — БОТ ЗАДАНИЙ</b>\n"
-DIVIDER = "━━━━━━━━━━━━━━━━━━━━\n"
-BOT_USERNAME = "your_bot"
-
-
-# ==== БАЗА ДАННЫХ ====
-def db_init():
-    parent = os.path.dirname(DB_PATH)
-    if parent and not os.path.exists(parent):
-        os.makedirs(parent, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            balance INTEGER DEFAULT 0,
-            sub_done INTEGER DEFAULT 0,
-            video_done INTEGER DEFAULT 0,
-            purchases INTEGER DEFAULT 0,
-            referrer_id INTEGER DEFAULT NULL,
-            ref_count INTEGER DEFAULT 0,
-            twitch_done INTEGER DEFAULT 0,
-            last_bonus INTEGER DEFAULT 0,
-            gold INTEGER DEFAULT 0
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS promos (
-            code TEXT PRIMARY KEY,
-            reward INTEGER NOT NULL,
-            uses_left INTEGER DEFAULT 1
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS promo_used (
-            code TEXT,
-            user_id INTEGER,
-            PRIMARY KEY (code, user_id)
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS withdrawals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            amount INTEGER,
-            details TEXT,
-            status TEXT DEFAULT 'pending',
-            created_at INTEGER
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS deposits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            amount INTEGER,
-            status TEXT DEFAULT 'pending',
-            created_at INTEGER
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
-def db_get_user(user_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT balance, sub_done, video_done, purchases, referrer_id, ref_count, twitch_done, last_bonus, gold "
-        "FROM users WHERE user_id = ?",
-        (user_id,),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def db_add_user(user_id: int, username: str, referrer_id: int = None):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username or ""))
-    if referrer_id and referrer_id != user_id:
-        cur.execute("SELECT referrer_id FROM users WHERE user_id = ?", (user_id,))
-        r = cur.fetchone()
-        if r and r[0] is None:
-            cur.execute("UPDATE users SET referrer_id = ? WHERE user_id = ?", (referrer_id, user_id))
-            cur.execute("UPDATE users SET ref_count = ref_count + 1, balance = balance + 5 WHERE user_id = ?", (referrer_id,))
-            cur.execute("UPDATE users SET balance = balance + 3 WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-
-
-def db_add_balance(user_id: int, amount: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
-    conn.commit()
-    conn.close()
-
-
-def db_add_gold(user_id: int, amount: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET gold = gold + ? WHERE user_id = ?", (amount, user_id))
-    conn.commit()
-    conn.close()
-
-
-def db_set_balance(user_id: int, amount: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET balance = ? WHERE user_id = ?", (amount, user_id))
-    conn.commit()
-    conn.close()
-
-
-def db_mark_task(user_id: int, task: str):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    if task == "sub":
-        cur.execute("UPDATE users SET sub_done = 1 WHERE user_id = ?", (user_id,))
-    elif task == "video":
-        cur.execute("UPDATE users SET video_done = 1 WHERE user_id = ?", (user_id,))
-    elif task == "twitch":
-        cur.execute("UPDATE users SET twitch_done = 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-
-
-def db_set_last_bonus(user_id: int, ts: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET last_bonus = ? WHERE user_id = ?", (ts, user_id))
-    conn.commit()
-    conn.close()
-
-
-def db_add_purchase(user_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET purchases = purchases + 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-
-
-def db_get_all_users():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, username, balance, ref_count FROM users")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def db_create_promo(code: str, reward: int, uses: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO promos (code, reward, uses_left) VALUES (?, ?, ?)", (code, reward, uses))
-    conn.commit()
-    conn.close()
-
-
-def db_get_promo(code: str):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT reward, uses_left FROM promos WHERE code = ?", (code,))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def db_use_promo(code: str, user_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO promo_used (code, user_id) VALUES (?, ?)", (code, user_id))
-    cur.execute("UPDATE promos SET uses_left = uses_left - 1 WHERE code = ?", (code,))
-    conn.commit()
-    conn.close()
-
-
-def db_promo_already_used(code: str, user_id: int) -> bool:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM promo_used WHERE code = ? AND user_id = ?", (code, user_id))
-    row = cur.fetchone()
-    conn.close()
-    return row is not None
-
-
-def db_list_promos():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT code, reward, uses_left FROM promos ORDER BY code")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def db_create_withdrawal(user_id: int, amount: int, details: str):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO withdrawals (user_id, amount, details, created_at) VALUES (?, ?, ?, ?)",
-        (user_id, amount, details, int(time.time())),
-    )
-    conn.commit()
-    conn.close()
-
-
-def db_get_pending_withdrawals():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT id, user_id, amount, details FROM withdrawals WHERE status = 'pending' ORDER BY id")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def db_complete_withdrawal(withdrawal_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, amount FROM withdrawals WHERE id = ? AND status = 'pending'", (withdrawal_id,))
-    row = cur.fetchone()
-    if row:
-        user_id, amount = row
-        cur.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, user_id))
-        cur.execute("UPDATE withdrawals SET status = 'done' WHERE id = ?", (withdrawal_id,))
-    conn.commit()
-    conn.close()
-
-
-def db_create_deposit(user_id: int, amount: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO deposits (user_id, amount, created_at) VALUES (?, ?, ?)",
-        (user_id, amount, int(time.time())),
-    )
-    conn.commit()
-    conn.close()
-
-
-def db_get_pending_deposits():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT id, user_id, amount FROM deposits WHERE status = 'pending' ORDER BY id")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def db_complete_deposit(deposit_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, amount FROM deposits WHERE id = ? AND status = 'pending'", (deposit_id,))
-    row = cur.fetchone()
-    if row:
-        user_id, amount = row
-        cur.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
-        cur.execute("UPDATE deposits SET status = 'done' WHERE id = ?", (deposit_id,))
-    conn.commit()
-    conn.close()
-
-
-# ==== ОФОРМЛЕНИЕ ====
-def profile_text(user_id: int) -> str:
-    u = db_get_user(user_id)
-    balance = u[0] if u else 0
-    purchases = u[3] if u else 0
-    ref_count = u[5] if u else 0
-    gold = u[8] if u else 0
-    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref{user_id}"
-    return (
-        f"{HEADER}{DIVIDER}"
-        f"👤 <b>Профиль</b>\n\n"
-        f"🆔 ID: <code>{user_id}</code>\n"
-        f"💎 Баланс: <code>{balance}</code> баллов\n"
-        f"🌟 Голда: <code>{gold}</code>\n"
-        f"🛒 Покупок: <code>{purchases}</code>\n"
-        f"👥 Рефералов: <code>{ref_count}</code>\n\n"
-        f"🔗 Твоя ссылка:\n<code>{ref_link}</code>\n\n"
-        f"{DIVIDER}"
-        f"Выбери действие ниже 👇"
-    )
-
-
-def main_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
-        [InlineKeyboardButton(text="🛒 Магазин", callback_data="shop")],
-        [InlineKeyboardButton(text="🎁 Ввести промокод", callback_data="enter_promo")],
-        [InlineKeyboardButton(text="📋 Задания", callback_data="tasks")],
-        [InlineKeyboardButton(text="💸 Вывод средств", callback_data="withdraw")],
-    ])
-
-
-def shop_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎰 Кейс Миг Удачи — 25", callback_data="buy_case")],
-        [InlineKeyboardButton(text="💎 100 GOLD — 65", callback_data="buy_gold100")],
-        [InlineKeyboardButton(text="💎 1000 GOLD — 600", callback_data="buy_gold1000")],
-        [InlineKeyboardButton(text="✊ Камень-ножницы-бумага — 3", callback_data="game_rps")],
-        [InlineKeyboardButton(text="🔢 Угадай число — 3", callback_data="game_guess")],
-        [InlineKeyboardButton(text="🎲 Кости — 3", callback_data="game_dice")],
-        [InlineKeyboardButton(text="🔢 Больше-меньше — 3", callback_data="game_hilo")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")],
-    ])
-
-
-def tasks_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    u = db_get_user(user_id)
-    sub_done = u[1] if u else 0
-    video_done = u[2] if u else 0
-    twitch_done = u[6] if u else 0
-
-    rows = []
-    if not sub_done:
-        rows.append([InlineKeyboardButton(text="📺 Подписаться на канал  +5", callback_data="task_sub")])
-    if not video_done:
-        rows.append([InlineKeyboardButton(text="👀 Посмотреть видео  +3", callback_data="task_video")])
-    if not twitch_done:
-        rows.append([InlineKeyboardButton(text="🟣 Перейти на Twitch", callback_data="twitch_go")])
-    if not rows:
-        rows.append([InlineKeyboardButton(text="✅ Все задания выполнены", callback_data="noop")])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def admin_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Создать промокод", callback_data="admin_create_promo")],
-        [InlineKeyboardButton(text="📋 Список промокодов", callback_data="admin_list_promos")],
-        [InlineKeyboardButton(text="💰 Изменить баланс", callback_data="admin_set_balance")],
-        [InlineKeyboardButton(text="💳 Заявки на депозит", callback_data="admin_deposits")],
-        [InlineKeyboardButton(text="💸 Заявки на вывод", callback_data="admin_withdrawals")],
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")],
-    ])
-
-
-def reply_menu():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="🛒 Магазин")],
-            [KeyboardButton(text="🎁 Бонус"), KeyboardButton(text="📋 Задания")],
-            [KeyboardButton(text="💳 Депозит"), KeyboardButton(text="💸 Вывод")],
-            [KeyboardButton(text="❓ Помощь")],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-    )
-
-
 def rps_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -431,7 +36,6 @@ def hilo_keyboard():
     ])
 
 
-# ==== АНТИФЛУД ====
 def is_flooding(user_id: int) -> bool:
     now = time.time()
     last = LAST_CLICK.get(user_id, 0)
@@ -441,7 +45,6 @@ def is_flooding(user_id: int) -> bool:
     return False
 
 
-# ==== СТАРТ / АДМИН-КОМАНДЫ ====
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     args = message.text.split(maxsplit=1)
@@ -499,7 +102,62 @@ async def cmd_create_promo(message: Message):
     await message.answer(f"✅ Промокод <code>{code}</code> на {reward} баллов, использований: {uses}")
 
 
-# ==== ТЕКСТОВЫЕ КНОПКИ REPLY-МЕНЮ ====
+@dp.message(F.text.startswith("/dep"))
+async def handle_deposit_request(message: Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Формат: <code>/dep сумма</code>\nПример: <code>/dep 100</code>")
+        return
+    try:
+        amount = int(parts[1])
+    except ValueError:
+        await message.answer("Сумма — число.")
+        return
+    if amount < 10:
+        await message.answer("❌ Минимум — 10 баллов.")
+        return
+    if amount > 100000:
+        await message.answer("❌ Максимум — 100 000 баллов.")
+        return
+    code = db_get_or_create_deposit_code(message.from_user.id)
+    db_create_deposit(message.from_user.id, amount, code)
+    await message.answer(
+        f"✅ Заявка на пополнение <b>{amount}</b> баллов создана.\n"
+        f"Твой код: <code>{code}</code>\n\n"
+        f"Не забудь указать его в комментарии к переводу.",
+        reply_markup=reply_menu(),
+    )
+
+
+@dp.message(F.text.startswith("/wd"))
+async def handle_withdraw_request(message: Message):
+    parts = message.text.split(maxsplit=2)
+    if len(parts) != 3:
+        await message.answer("Формат: <code>/wd сумма реквизиты</code>\nПример: <code>/wd 100 2200123456789012</code>")
+        return
+    try:
+        amount = int(parts[1])
+    except ValueError:
+        await message.answer("Сумма — число.")
+        return
+    details = parts[2]
+    if amount < 100:
+        await message.answer("❌ Минимум для вывода — 100 баллов.")
+        return
+    u = db_get_user(message.from_user.id)
+    balance = u[0] if u else 0
+    if balance < amount:
+        await message.answer(f"❌ Недостаточно баллов. У тебя {balance}.")
+        return
+    db_create_withdrawal(message.from_user.id, amount, details)
+    await message.answer(
+        f"✅ Заявка на вывод <b>{amount} ₽</b> создана.\n"
+        f"Реквизиты: <code>{details}</code>\n\n"
+        f"Администратор обработает её в ближайшее время.",
+        reply_markup=reply_menu(),
+    )
+
+
 @dp.message(F.text == "👤 Профиль")
 async def btn_profile(message: Message):
     await message.answer(profile_text(message.from_user.id), reply_markup=reply_menu())
@@ -551,11 +209,18 @@ async def btn_daily_bonus(message: Message):
 
 @dp.message(F.text == "💳 Депозит")
 async def btn_deposit(message: Message):
+    code = db_get_or_create_deposit_code(message.from_user.id)
     await message.answer(
-        "💳 <b>Пополнение баланса</b>\n\n"
-        "Отправь сумму пополнения в баллах одним сообщением.\n"
-        "Пример: <code>100</code>\n\n"
-        "После создания заявки администратор подтвердит платёж, и баллы будут начислены.",
+        f"💳 <b>Пополнение баланса</b>\n\n"
+        f"Переведи сумму на карту:\n"
+        f"🏦 <b>{DEPOSIT_BANK}</b>\n"
+        f"💳 <code>{DEPOSIT_CARD}</code>\n\n"
+        f"⚠️ <b>Обязательно</b> укажи в комментарии к переводу код:\n"
+        f"<code>{code}</code>\n\n"
+        f"Затем отправь команду:\n"
+        f"<code>/dep сумма</code>\n"
+        f"Пример: <code>/dep 100</code>\n\n"
+        f"Администратор проверит платёж по коду и начислит баллы.",
         reply_markup=reply_menu(),
     )
 
@@ -566,8 +231,9 @@ async def btn_withdraw(message: Message):
         "💸 <b>Вывод средств</b>\n\n"
         "Курс: <b>1 балл = 1 ₽</b>\n"
         "Минимум: <b>100 баллов</b>\n\n"
-        "Отправь одним сообщением: <code>сумма реквизиты</code>\n"
-        "Пример: <code>100 2200123456789012</code>",
+        "Отправь команду:\n"
+        "<code>/wd сумма реквизиты</code>\n"
+        "Пример: <code>/wd 100 2200123456789012</code>",
         reply_markup=reply_menu(),
     )
 
@@ -580,14 +246,14 @@ async def btn_help(message: Message):
         f"• <b>🛒 Магазин</b> — кейс, GOLD, мини-игры\n"
         f"• <b>🎁 Бонус</b> — раз в 24 часа, 3–5 баллов\n"
         f"• <b>📋 Задания</b> — подписки за баллы\n"
-        f"• <b>💳 Депозит</b> — заявка на пополнение\n"
+        f"• <b>💳 Депозит</b> — пополнение через Сбербанк (с кодом)\n"
         f"• <b>💸 Вывод</b> — обмен баллов на рубли (1:1), минимум 100\n\n"
-        f"Админ-команды: /admin",
+        f"Команды: /dep сумма, /wd сумма реквизиты\n"
+        f"Админ: /admin",
         reply_markup=reply_menu(),
     )
 
 
-# ==== ИНЛАЙН-ХЕНДЛЕРЫ ====
 @dp.callback_query(F.data == "back")
 async def back_to_main(callback: CallbackQuery):
     await callback.message.edit_text(profile_text(callback.from_user.id), reply_markup=main_keyboard())
@@ -633,14 +299,32 @@ async def open_shop(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "deposit_info")
+async def deposit_info(callback: CallbackQuery):
+    code = db_get_or_create_deposit_code(callback.from_user.id)
+    await callback.message.answer(
+        f"💳 <b>Пополнение баланса</b>\n\n"
+        f"Переведи сумму на карту:\n"
+        f"🏦 <b>{DEPOSIT_BANK}</b>\n"
+        f"💳 <code>{DEPOSIT_CARD}</code>\n\n"
+        f"⚠️ <b>Обязательно</b> укажи в комментарии к переводу код:\n"
+        f"<code>{code}</code>\n\n"
+        f"Затем отправь команду:\n"
+        f"<code>/dep сумма</code>\n"
+        f"Пример: <code>/dep 100</code>",
+    )
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "withdraw")
 async def open_withdraw(callback: CallbackQuery):
     await callback.message.answer(
         "💸 <b>Вывод средств</b>\n\n"
         "Курс: <b>1 балл = 1 ₽</b>\n"
         "Минимум: <b>100 баллов</b>\n\n"
-        "Отправь одним сообщением: <code>сумма реквизиты</code>\n"
-        "Пример: <code>100 2200123456789012</code>",
+        "Отправь команду:\n"
+        "<code>/wd сумма реквизиты</code>\n"
+        "Пример: <code>/wd 100 2200123456789012</code>",
     )
     await callback.answer()
 
@@ -704,7 +388,6 @@ async def _buy_gold(callback: CallbackQuery, gold: int, price: int):
     )
 
 
-# ==== ЗАДАНИЯ ====
 @dp.callback_query(F.data == "task_sub")
 async def process_task_sub(callback: CallbackQuery):
     if is_flooding(callback.from_user.id):
@@ -787,7 +470,6 @@ async def process_task_twitch(callback: CallbackQuery):
     )
 
 
-# ==== ИГРЫ ====
 @dp.callback_query(F.data == "game_rps")
 async def game_rps_start(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -961,53 +643,6 @@ async def game_hilo_play(callback: CallbackQuery):
     await callback.answer()
 
 
-# ==== ДЕПОЗИТ И ВЫВОД ====
-@dp.message(F.text.regexp(r"^\d+$"))
-async def handle_deposit_amount(message: Message):
-    try:
-        amount = int(message.text.strip())
-    except ValueError:
-        return
-    if amount < 10:
-        await message.answer("❌ Минимум для пополнения — 10 баллов.")
-        return
-    if amount > 100000:
-        await message.answer("❌ Максимум — 100 000 баллов.")
-        return
-    db_create_deposit(message.from_user.id, amount)
-    await message.answer(
-        f"✅ Заявка на пополнение <b>{amount}</b> баллов создана.\n"
-        f"Администратор подтвердит её после оплаты.",
-        reply_markup=reply_menu(),
-    )
-
-
-@dp.message(F.text.regexp(r"^\d+\s+.+$"))
-async def handle_withdraw_request(message: Message):
-    parts = message.text.split(maxsplit=1)
-    try:
-        amount = int(parts[0])
-        details = parts[1]
-    except (ValueError, IndexError):
-        return
-    if amount < 100:
-        await message.answer("❌ Минимум для вывода — 100 баллов.")
-        return
-    u = db_get_user(message.from_user.id)
-    balance = u[0] if u else 0
-    if balance < amount:
-        await message.answer(f"❌ Недостаточно баллов. У тебя {balance}.")
-        return
-    db_create_withdrawal(message.from_user.id, amount, details)
-    await message.answer(
-        f"✅ Заявка на вывод <b>{amount} ₽</b> создана.\n"
-        f"Реквизиты: <code>{details}</code>\n\n"
-        f"Администратор обработает её в ближайшее время.",
-        reply_markup=reply_menu(),
-    )
-
-
-# ==== ПРОМОКОДЫ ====
 @dp.callback_query(F.data == "enter_promo")
 async def enter_promo(callback: CallbackQuery):
     await callback.message.answer("Введи промокод сообщением:")
@@ -1034,7 +669,6 @@ async def handle_text(message: Message):
     await message.answer(f"✅ Промокод <code>{text}</code> активирован! +{reward} баллов")
 
 
-# ==== АДМИН-ПАНЕЛЬ (ИНЛАЙН) ====
 @dp.callback_query(F.data == "admin_create_promo")
 async def admin_create_promo(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
@@ -1079,13 +713,20 @@ async def admin_deposits(callback: CallbackQuery):
         await callback.message.answer("Заявок на депозит нет.")
         await callback.answer()
         return
-    for did, uid, amount in rows:
+    for did, uid, amount, details in rows:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT deposit_code FROM users WHERE user_id = ?", (uid,))
+        row = cur.fetchone()
+        conn.close()
+        code = row[0] if row and row[0] else "—"
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"ddone_{did}")]
         ])
         await callback.message.answer(
             f"💳 <b>Депозит #{did}</b>\n"
             f"Пользователь: <code>{uid}</code>\n"
+            f"Код: <code>{code}</code>\n"
             f"Сумма: <b>{amount}</b> баллов",
             reply_markup=kb,
         )
@@ -1168,7 +809,6 @@ async def admin_stats(callback: CallbackQuery):
     await callback.answer()
 
 
-# ==== ЗАПУСК ====
 async def main():
     db_init()
     me = await bot.get_me()
