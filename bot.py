@@ -38,8 +38,6 @@ dp = Dispatcher()
 
 LAST_CLICK = {}
 CLICK_COOLDOWN = 2
-GAME_COOLDOWN = 30
-LAST_GAME = {}
 HILO_CURRENT = {}
 
 HEADER = "🎮 <b>STANDOFF 2 — БОТ ЗАДАНИЙ</b>\n"
@@ -230,14 +228,6 @@ def db_list_promos():
     return rows
 
 
-def db_delete_promo(code: str):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM promos WHERE code = ?", (code,))
-    conn.commit()
-    conn.close()
-
-
 def db_create_withdrawal(user_id: int, amount: int, details: str):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -328,8 +318,7 @@ def tasks_keyboard(user_id: int) -> InlineKeyboardMarkup:
     if not video_done:
         rows.append([InlineKeyboardButton(text="👀 Посмотреть видео  +3", callback_data="task_video")])
     if not twitch_done:
-        rows.append([InlineKeyboardButton(text="🟣 Перейти на Twitch", url="https://www.twitch.tv/kastega")])
-        rows.append([InlineKeyboardButton(text="✅ Я подписался (+5)", callback_data="task_twitch")])
+        rows.append([InlineKeyboardButton(text="🟣 Перейти на Twitch", callback_data="twitch_go")])
     if not rows:
         rows.append([InlineKeyboardButton(text="✅ Все задания выполнены", callback_data="noop")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back")])
@@ -405,13 +394,6 @@ def is_flooding(user_id: int) -> bool:
         return True
     LAST_CLICK[user_id] = now
     return False
-
-
-def game_cooldown_left(user_id: int) -> int:
-    now = time.time()
-    last = LAST_GAME.get(user_id, 0)
-    left = GAME_COOLDOWN - (now - last)
-    return int(left) if left > 0 else 0
 
 
 # ==== СТАРТ / АДМИН-КОМАНДЫ ====
@@ -714,6 +696,20 @@ async def process_task_video(callback: CallbackQuery):
     )
 
 
+@dp.callback_query(F.data == "twitch_go")
+async def twitch_go(callback: CallbackQuery):
+    await callback.answer(url="https://www.twitch.tv/kastega")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Я подписался (+5)", callback_data="task_twitch")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")],
+    ])
+    await callback.message.edit_text(
+        f"{HEADER}{DIVIDER}📋 <b>Задание Twitch</b>\n{DIVIDER}"
+        f"Ты перешёл на Twitch. Подпишись на канал и нажми «Я подписался».",
+        reply_markup=kb,
+    )
+
+
 @dp.callback_query(F.data == "task_twitch")
 async def process_task_twitch(callback: CallbackQuery):
     if is_flooding(callback.from_user.id):
@@ -738,10 +734,6 @@ async def process_task_twitch(callback: CallbackQuery):
 @dp.callback_query(F.data == "game_rps")
 async def game_rps_start(callback: CallbackQuery):
     user_id = callback.from_user.id
-    left = game_cooldown_left(user_id)
-    if left > 0:
-        await callback.answer(f"⏳ Подожди {left} сек.", show_alert=True)
-        return
     u = db_get_user(user_id)
     balance = u[0] if u else 0
     if balance < 3:
@@ -760,11 +752,6 @@ async def game_rps_start(callback: CallbackQuery):
 @dp.callback_query(F.data.in_({"rps_rock", "rps_paper", "rps_scissors"}))
 async def game_rps_play(callback: CallbackQuery):
     user_id = callback.from_user.id
-    left = game_cooldown_left(user_id)
-    if left > 0:
-        await callback.answer(f"⏳ Подожди {left} сек.", show_alert=True)
-        return
-
     choices = {"rps_rock": "✊ Камень", "rps_paper": "✋ Бумага", "rps_scissors": "✌️ Ножницы"}
     user_choice = callback.data
     bot_choice = random.choice(list(choices.keys()))
@@ -783,8 +770,6 @@ async def game_rps_play(callback: CallbackQuery):
     if reward:
         db_add_balance(user_id, reward)
 
-    LAST_GAME[user_id] = time.time()
-
     await callback.message.edit_text(
         f"✊✋✌️ <b>Камень-ножницы-бумага</b>\n{DIVIDER}"
         f"Ты: <b>{choices[user_choice]}</b>\n"
@@ -798,10 +783,6 @@ async def game_rps_play(callback: CallbackQuery):
 @dp.callback_query(F.data == "game_guess")
 async def game_guess_start(callback: CallbackQuery):
     user_id = callback.from_user.id
-    left = game_cooldown_left(user_id)
-    if left > 0:
-        await callback.answer(f"⏳ Подожди {left} сек.", show_alert=True)
-        return
     u = db_get_user(user_id)
     balance = u[0] if u else 0
     if balance < 3:
@@ -821,11 +802,6 @@ async def game_guess_start(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("guess_"))
 async def game_guess_play(callback: CallbackQuery):
     user_id = callback.from_user.id
-    left = game_cooldown_left(user_id)
-    if left > 0:
-        await callback.answer(f"⏳ Подожди {left} сек.", show_alert=True)
-        return
-
     try:
         user_num = int(callback.data.split("_")[1])
     except (IndexError, ValueError):
@@ -833,7 +809,6 @@ async def game_guess_play(callback: CallbackQuery):
         return
 
     secret = random.randint(1, 10)
-    LAST_GAME[user_id] = time.time()
 
     if user_num == secret:
         db_add_balance(user_id, 5)
@@ -853,10 +828,6 @@ async def game_guess_play(callback: CallbackQuery):
 @dp.callback_query(F.data == "game_dice")
 async def game_dice_start(callback: CallbackQuery):
     user_id = callback.from_user.id
-    left = game_cooldown_left(user_id)
-    if left > 0:
-        await callback.answer(f"⏳ Подожди {left} сек.", show_alert=True)
-        return
     u = db_get_user(user_id)
     balance = u[0] if u else 0
     if balance < 3:
@@ -865,7 +836,6 @@ async def game_dice_start(callback: CallbackQuery):
     db_add_balance(user_id, -3)
     user_roll = random.randint(1, 6)
     bot_roll = random.randint(1, 6)
-    LAST_GAME[user_id] = time.time()
 
     if user_roll > bot_roll:
         db_add_balance(user_id, 6)
@@ -888,10 +858,6 @@ async def game_dice_start(callback: CallbackQuery):
 @dp.callback_query(F.data == "game_hilo")
 async def game_hilo_start(callback: CallbackQuery):
     user_id = callback.from_user.id
-    left = game_cooldown_left(user_id)
-    if left > 0:
-        await callback.answer(f"⏳ Подожди {left} сек.", show_alert=True)
-        return
     u = db_get_user(user_id)
     balance = u[0] if u else 0
     if balance < 3:
@@ -913,10 +879,6 @@ async def game_hilo_start(callback: CallbackQuery):
 @dp.callback_query(F.data.in_({"hilo_more", "hilo_less"}))
 async def game_hilo_play(callback: CallbackQuery):
     user_id = callback.from_user.id
-    left = game_cooldown_left(user_id)
-    if left > 0:
-        await callback.answer(f"⏳ Подожди {left} сек.", show_alert=True)
-        return
     current = HILO_CURRENT.get(user_id)
     if current is None:
         await callback.answer("Начни игру заново", show_alert=True)
@@ -932,7 +894,6 @@ async def game_hilo_play(callback: CallbackQuery):
     else:
         result = f"😢 Не угадал. Было {current}, стало {next_num}."
 
-    LAST_GAME[user_id] = time.time()
     HILO_CURRENT.pop(user_id, None)
 
     await callback.message.edit_text(
