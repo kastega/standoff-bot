@@ -172,10 +172,10 @@ async def btn_shop(message: Message):
         f"🛒 <b>МАГАЗИН</b>\n{DIVIDER}"
         f"💎 Твой баланс: <code>{balance}</code> баллов\n"
         f"🌟 Голда: <code>{gold}</code>\n\n"
-        f"🎰 <b>Кейс Миг Удачи</b> — 25 баллов\n"
+        f"🎰 <b>Кейс Миг Удачи</b> — {CASE_PRICE} баллов\n"
         f"💎 <b>100 GOLD</b> — 65 баллов\n"
         f"💎 <b>1000 GOLD</b> — 600 баллов\n\n"
-        f"🎮 <b>Мини-игры</b> — 3 балла за игру"
+        f"🎮 <b>Мини-игры</b> — от {min(RPS_BET, GUESS_BET, DICE_BET, HILO_BET)} баллов"
     )
     await message.answer(text, reply_markup=shop_keyboard())
 
@@ -289,10 +289,10 @@ async def open_shop(callback: CallbackQuery):
         f"🛒 <b>МАГАЗИН</b>\n{DIVIDER}"
         f"💎 Твой баланс: <code>{balance}</code> баллов\n"
         f"🌟 Голда: <code>{gold}</code>\n\n"
-        f"🎰 <b>Кейс Миг Удачи</b> — 25 баллов (от 1 до 50)\n"
+        f"🎰 <b>Кейс Миг Удачи</b> — {CASE_PRICE} баллов\n"
         f"💎 <b>100 GOLD</b> — 65 баллов\n"
         f"💎 <b>1000 GOLD</b> — 600 баллов\n\n"
-        f"🎮 <b>Мини-игры</b> — 3 балла за игру\n\n"
+        f"🎮 <b>Мини-игры</b> — от {min(RPS_BET, GUESS_BET, DICE_BET, HILO_BET)} баллов\n\n"
         f"Выбери товар 👇"
     )
     await callback.message.edit_text(text, reply_markup=shop_keyboard())
@@ -336,19 +336,18 @@ async def buy_case(callback: CallbackQuery):
         return
     u = db_get_user(callback.from_user.id)
     balance = u[0] if u else 0
-    price = 25
-    if balance < price:
-        await callback.answer(f"❌ Нужно {price} баллов, у тебя {balance}", show_alert=True)
+    if balance < CASE_PRICE:
+        await callback.answer(f"❌ Нужно {CASE_PRICE} баллов, у тебя {balance}", show_alert=True)
         return
-    db_add_balance(callback.from_user.id, -price)
+    db_add_balance(callback.from_user.id, -CASE_PRICE)
     db_add_purchase(callback.from_user.id)
-    prize = random.randint(1, 50)
+    prize = random.choices(CASE_PRIZES, weights=CASE_WEIGHTS, k=1)[0]
     db_add_balance(callback.from_user.id, prize)
     await callback.answer(f"🎰 Выпало {prize} баллов!", show_alert=True)
-    new_bal = balance - price + prize
+    new_bal = balance - CASE_PRICE + prize
     await callback.message.edit_text(
         f"🎰 <b>Кейс Миг Удачи</b>\n{DIVIDER}"
-        f"💸 Стоимость: <code>{price}</code>\n"
+        f"💸 Стоимость: <code>{CASE_PRICE}</code>\n"
         f"🎁 Выпало: <code>{prize}</code> баллов\n"
         f"💎 Новый баланс: <code>{new_bal}</code>",
         reply_markup=shop_keyboard(),
@@ -475,14 +474,14 @@ async def game_rps_start(callback: CallbackQuery):
     user_id = callback.from_user.id
     u = db_get_user(user_id)
     balance = u[0] if u else 0
-    if balance < 3:
-        await callback.answer(f"❌ Нужно 3 балла для игры. У тебя {balance}.", show_alert=True)
+    if balance < RPS_BET:
+        await callback.answer(f"❌ Нужно {RPS_BET} баллов для игры. У тебя {balance}.", show_alert=True)
         return
-    db_add_balance(user_id, -3)
+    db_add_balance(user_id, -RPS_BET)
     await callback.message.edit_text(
         f"✊✋✌️ <b>Камень-ножницы-бумага</b>\n{DIVIDER}"
-        f"💸 Списано: <b>3</b> балла\n"
-        f"Выбери свой вариант. Победа — <b>+3</b> балла.",
+        f"💸 Списано: <b>{RPS_BET}</b> балла\n"
+        f"Выбери свой вариант. Победа — <b>+{RPS_WIN - RPS_BET}</b> (возврат {RPS_WIN}), ничья — возврат {RPS_BET}.",
         reply_markup=rps_keyboard(),
     )
     await callback.answer()
@@ -497,23 +496,19 @@ async def game_rps_play(callback: CallbackQuery):
     beats = {"rps_rock": "rps_scissors", "rps_paper": "rps_rock", "rps_scissors": "rps_paper"}
 
     if user_choice == bot_choice:
-        result = "🤝 Ничья!"
-        reward = 0
+        db_add_balance(user_id, RPS_BET)
+        result = f"🤝 Ничья! Ставка {RPS_BET} возвращена."
     elif beats[user_choice] == bot_choice:
-        result = "🎉 Ты победил!"
-        reward = 3
+        db_add_balance(user_id, RPS_WIN)
+        result = f"🎉 Ты победил! +{RPS_WIN - RPS_BET} баллов (возврат {RPS_WIN})"
     else:
-        result = "😢 Ты проиграл"
-        reward = 0
-
-    if reward:
-        db_add_balance(user_id, reward)
+        result = f"😢 Ты проиграл. Ставка {RPS_BET} баллов потеряна."
 
     await callback.message.edit_text(
         f"✊✋✌️ <b>Камень-ножницы-бумага</b>\n{DIVIDER}"
         f"Ты: <b>{choices[user_choice]}</b>\n"
         f"Бот: <b>{choices[bot_choice]}</b>\n\n"
-        f"{result}" + (f"\n💎 +{reward} баллов" if reward else ""),
+        f"{result}",
         reply_markup=shop_keyboard(),
     )
     await callback.answer()
@@ -524,15 +519,15 @@ async def game_guess_start(callback: CallbackQuery):
     user_id = callback.from_user.id
     u = db_get_user(user_id)
     balance = u[0] if u else 0
-    if balance < 3:
-        await callback.answer(f"❌ Нужно 3 балла для игры. У тебя {balance}.", show_alert=True)
+    if balance < GUESS_BET:
+        await callback.answer(f"❌ Нужно {GUESS_BET} баллов для игры. У тебя {balance}.", show_alert=True)
         return
-    db_add_balance(user_id, -3)
+    db_add_balance(user_id, -GUESS_BET)
     await callback.message.edit_text(
         f"🔢 <b>Угадай число</b>\n{DIVIDER}"
-        f"💸 Списано: <b>3</b> балла\n"
+        f"💸 Списано: <b>{GUESS_BET}</b> баллов\n"
         f"Я загадал число от <b>1 до 10</b>.\n"
-        f"Угадаешь — <b>+5</b> баллов.",
+        f"Угадаешь — <b>+{GUESS_WIN}</b> баллов.",
         reply_markup=guess_keyboard(),
     )
     await callback.answer()
@@ -550,8 +545,8 @@ async def game_guess_play(callback: CallbackQuery):
     secret = random.randint(1, 10)
 
     if user_num == secret:
-        db_add_balance(user_id, 5)
-        result = f"🎉 Угадал! Число было <b>{secret}</b>.\n💎 +5 баллов"
+        db_add_balance(user_id, GUESS_WIN)
+        result = f"🎉 Угадал! Число было <b>{secret}</b>.\n💎 +{GUESS_WIN} баллов"
     else:
         result = f"😢 Не угадал. Число было <b>{secret}</b>."
 
@@ -569,21 +564,21 @@ async def game_dice_start(callback: CallbackQuery):
     user_id = callback.from_user.id
     u = db_get_user(user_id)
     balance = u[0] if u else 0
-    if balance < 3:
-        await callback.answer(f"❌ Нужно 3 балла для игры. У тебя {balance}.", show_alert=True)
+    if balance < DICE_BET:
+        await callback.answer(f"❌ Нужно {DICE_BET} баллов для игры. У тебя {balance}.", show_alert=True)
         return
-    db_add_balance(user_id, -3)
+    db_add_balance(user_id, -DICE_BET)
     user_roll = random.randint(1, 6)
     bot_roll = random.randint(1, 6)
 
     if user_roll > bot_roll:
-        db_add_balance(user_id, 6)
-        result = "🎉 Ты победил! +3 балла (банк 6)"
+        db_add_balance(user_id, DICE_WIN)
+        result = f"🎉 Ты победил! +{DICE_WIN - DICE_BET} баллов (возврат {DICE_WIN})"
     elif user_roll < bot_roll:
-        result = "😢 Ты проиграл. Ставка 3 балла потеряна."
+        result = f"😢 Ты проиграл. Ставка {DICE_BET} баллов потеряна."
     else:
-        db_add_balance(user_id, 3)
-        result = "🤝 Ничья! Ставка возвращена."
+        db_add_balance(user_id, DICE_DRAW)
+        result = f"🤝 Ничья! Ставка {DICE_DRAW} возвращена."
 
     await callback.message.edit_text(
         f"🎲 <b>Кости</b>\n{DIVIDER}"
@@ -599,17 +594,17 @@ async def game_hilo_start(callback: CallbackQuery):
     user_id = callback.from_user.id
     u = db_get_user(user_id)
     balance = u[0] if u else 0
-    if balance < 3:
-        await callback.answer(f"❌ Нужно 3 балла для игры. У тебя {balance}.", show_alert=True)
+    if balance < HILO_BET:
+        await callback.answer(f"❌ Нужно {HILO_BET} баллов для игры. У тебя {balance}.", show_alert=True)
         return
-    db_add_balance(user_id, -3)
+    db_add_balance(user_id, -HILO_BET)
     current = random.randint(1, 100)
     HILO_CURRENT[user_id] = current
     await callback.message.edit_text(
         f"🔢 <b>Больше-меньше</b>\n{DIVIDER}"
-        f"💸 Списано: <b>3</b> балла\n"
+        f"💸 Списано: <b>{HILO_BET}</b> баллов\n"
         f"Текущее число: <b>{current}</b>\n\n"
-        f"Следующее будет больше или меньше? Победа — <b>+5</b> баллов.",
+        f"Следующее будет больше или меньше? Победа — <b>+{HILO_WIN}</b> баллов.",
         reply_markup=hilo_keyboard(),
     )
     await callback.answer()
@@ -628,8 +623,8 @@ async def game_hilo_play(callback: CallbackQuery):
     win = (next_num > current and guess_more) or (next_num < current and not guess_more)
 
     if win:
-        db_add_balance(user_id, 5)
-        result = f"🎉 Угадал! Было {current}, стало {next_num}. +5 баллов"
+        db_add_balance(user_id, HILO_WIN)
+        result = f"🎉 Угадал! Было {current}, стало {next_num}. +{HILO_WIN} баллов"
     else:
         result = f"😢 Не угадал. Было {current}, стало {next_num}."
 
